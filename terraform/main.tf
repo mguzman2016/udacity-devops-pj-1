@@ -6,23 +6,16 @@ provider "azurerm" {
 # Pre-import step:
 # terraform import azurerm_resource_group.main /subscriptions/{SUBSCRIPTION_ID}/resourceGroups/{RESOURCE_GROUP_NAME}
 # terraform import azurerm_resource_group.main /subscriptions/1780bc89-8672-4bcd-8b0f-016eb40d22da/resourceGroups/Azuredevops
-# data "azurerm_resource_group" "main" {
-#   name = var.resource_group
-# }
-
-resource "azurerm_resource_group" "main" {
-  # The name and location are placeholders; Terraform requires these during import
-  name     = var.resource_group
-  location = var.location
+data "azurerm_resource_group" "main" {
+  name = var.resource_group
 }
-
 
 # Create a Virtual network
 resource "azurerm_virtual_network" "vms_net" {
   name                = "${var.prefix}-network"
   address_space       = ["10.0.0.0/16"]
-  location            = azurerm_resource_group.main.location
-  resource_group_name = azurerm_resource_group.main.name
+  location            = data.azurerm_resource_group.main.location
+  resource_group_name = data.azurerm_resource_group.main.name
 
   tags = {
     env = "Production"
@@ -32,39 +25,79 @@ resource "azurerm_virtual_network" "vms_net" {
 # And a subnet on that virtual network
 resource "azurerm_subnet" "vms_internal" {
   name                 = "internal"
-  resource_group_name  = azurerm_resource_group.main.name
+  resource_group_name  = data.azurerm_resource_group.main.name
   virtual_network_name = azurerm_virtual_network.vms_net.name
   address_prefixes     = ["10.0.2.0/24"]
 }
 
 resource "azurerm_network_security_group" "vms" {
   name                = "${var.prefix}-net-sg"
-  location            = azurerm_resource_group.main.location
-  resource_group_name = azurerm_resource_group.main.name
+  location            = data.azurerm_resource_group.main.location
+  resource_group_name = data.azurerm_resource_group.main.name
 
-  # Allow subnet VM communication
+  # Rule 1: Allow load balancer probes
   security_rule {
-    name                       = "${var.prefix}-internal-allow"
+    name                       = "${var.prefix}-allow-azure-load-balancer"
     priority                   = 100
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "*"
+    source_port_range          = "*"
+    destination_port_range     = "*"
+    source_address_prefix      = "AzureLoadBalancer"
+    destination_address_prefix = "*"
+  }
+
+  # Rule 2: Allow backend communication between VMs (VNet to VNet)
+  security_rule {
+    name                       = "${var.prefix}-vnet-allow"
+    priority                   = 102
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "*"
+    source_port_range          = "*"
+    destination_port_range     = "*"
+    source_address_prefix      = "VirtualNetwork"
+    destination_address_prefix = "*"
+  }
+
+  # Rule 3: Allow traffic from the Load Balancer frontend IP (client traffic)
+  security_rule {
+    name                       = "${var.prefix}-allow-lb-client-traffic"
+    priority                   = 110
     direction                  = "Inbound"
     access                     = "Allow"
     protocol                   = "Tcp"
     source_port_range          = "*"
-    destination_port_range     = "*"
-    source_address_prefix      = "10.0.2.0/24"
-    destination_address_prefix = "10.0.2.0/24"
+    destination_port_range     = "80"
+    source_address_prefix      = "0.0.0.0/0"
+    destination_address_prefix = "*"
   }
 
+  # Rule 4: Allow outbound traffic from VMs to the load balancer/backend
   security_rule {
-    name                       = "${var.prefix}-deny-external"
+    name                       = "${var.prefix}-vnet-outbound"
     priority                   = 200
+    direction                  = "Outbound"
+    access                     = "Allow"
+    protocol                   = "*"
+    source_port_range          = "*"
+    destination_port_range     = "*"
+    source_address_prefix      = "*"
+    destination_address_prefix = "VirtualNetwork"
+  }
+
+  # Rule 5: Deny all inbound traffic (default deny rule after specific allows)
+  security_rule {
+    name                       = "${var.prefix}-deny-all"
+    priority                   = 300
     direction                  = "Inbound"
     access                     = "Deny"
     protocol                   = "*"
     source_port_range          = "*"
     destination_port_range     = "*"
     source_address_prefix      = "0.0.0.0/0"
-    destination_address_prefix = "10.0.2.0/24"
+    destination_address_prefix = "*"
   }
 
   tags = {
@@ -82,8 +115,8 @@ resource "azurerm_subnet_network_security_group_association" "vms_nsg_assoc" {
 resource "azurerm_network_interface" "vms_nics" {
     count                   = var.vm_count
     name                    = "${var.prefix}-nic-${count.index}"
-    location                = azurerm_resource_group.main.location
-    resource_group_name     = azurerm_resource_group.main.name
+    location                = data.azurerm_resource_group.main.location
+    resource_group_name     = data.azurerm_resource_group.main.name
 
     ip_configuration {
         name                          = "${var.prefix}-ipconfig-${count.index}"
@@ -99,8 +132,8 @@ resource "azurerm_network_interface" "vms_nics" {
 # Create a public IP for the load balancer
 resource "azurerm_public_ip" "lb_public_ip" {
   name                = "${var.prefix}-load-balancer-public-ip"
-  resource_group_name = azurerm_resource_group.main.name
-  location            = azurerm_resource_group.main.location
+  resource_group_name = data.azurerm_resource_group.main.name
+  location            = data.azurerm_resource_group.main.location
   allocation_method   = "Static"
 
   tags = {
@@ -119,8 +152,8 @@ resource "azurerm_network_interface_backend_address_pool_association" "nic_load_
 # Create Public Load Balancer
 resource "azurerm_lb" "load_balancer" {
   name                    = "${var.prefix}-load-balancer"
-  location                = azurerm_resource_group.main.location
-  resource_group_name     = azurerm_resource_group.main.name
+  location                = data.azurerm_resource_group.main.location
+  resource_group_name     = data.azurerm_resource_group.main.name
   sku                     = "Standard"
 
   frontend_ip_configuration {
@@ -160,8 +193,8 @@ resource "azurerm_lb_rule" "http_rule" {
 # VM availability set
 resource "azurerm_availability_set" "vms_availability_set" {
   name                = "${var.prefix}-availability-set"
-  location            = azurerm_resource_group.main.location
-  resource_group_name = azurerm_resource_group.main.name
+  location            = data.azurerm_resource_group.main.location
+  resource_group_name = data.azurerm_resource_group.main.name
 
   tags = {
     environment = "Production"
@@ -177,8 +210,8 @@ data "azurerm_image" "packer_image" {
 resource "azurerm_virtual_machine" "vms" {
   count               = var.vm_count
   name                = "${var.prefix}-vm-${count.index}"
-  location            = azurerm_resource_group.main.location
-  resource_group_name = azurerm_resource_group.main.name
+  location            = data.azurerm_resource_group.main.location
+  resource_group_name = data.azurerm_resource_group.main.name
   availability_set_id = azurerm_availability_set.vms_availability_set.id
 
   network_interface_ids = [azurerm_network_interface.vms_nics[count.index].id]
